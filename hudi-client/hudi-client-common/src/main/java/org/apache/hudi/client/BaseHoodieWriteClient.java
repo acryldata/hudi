@@ -33,7 +33,6 @@ import org.apache.hudi.client.heartbeat.HeartbeatUtils;
 import org.apache.hudi.client.utils.TransactionUtils;
 import org.apache.hudi.common.HoodiePendingRollbackInfo;
 import org.apache.hudi.common.config.HoodieCommonConfig;
-import org.apache.hudi.common.config.HoodieConfig;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.ActionType;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
@@ -105,7 +104,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -227,7 +225,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     if (!config.allowEmptyCommit() && stats.isEmpty()) {
       return true;
     }
-    LOG.info("Committing " + instantTime + " action " + commitActionType);
+    LOG.info("Committing {} action {}", instantTime, commitActionType);
     // Create a Hoodie table which encapsulated the commits and files visible
     HoodieTable table = createTable(config);
     HoodieCommitMetadata metadata = CommitMetadataResolverFactory.get(
@@ -247,7 +245,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
       }
       commit(table, commitActionType, instantTime, metadata, stats);
       postCommit(table, metadata, instantTime, extraMetadata);
-      LOG.info("Committed " + instantTime);
+      LOG.info("Committed {}", instantTime);
     } catch (IOException e) {
       throw new HoodieCommitException("Failed to complete commit " + config.getBasePath() + " at time " + instantTime, e);
     } finally {
@@ -275,7 +273,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
 
   protected void commit(HoodieTable table, String commitActionType, String instantTime, HoodieCommitMetadata metadata,
                         List<HoodieWriteStat> stats) throws IOException {
-    LOG.info("Committing " + instantTime + " action " + commitActionType);
+    LOG.info("Committing {} action {}", instantTime, commitActionType);
     HoodieActiveTimeline activeTimeline = table.getActiveTimeline();
     // Finalize write
     finalizeWrite(table, instantTime, stats);
@@ -666,7 +664,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     }
 
     String latestCommit = table.getCompletedCommitsTimeline().lastInstant().get().requestedTime();
-    LOG.info("Savepointing latest commit " + latestCommit);
+    LOG.info("Savepointing latest commit {}", latestCommit);
     savepoint(latestCommit, user, comment);
   }
 
@@ -699,7 +697,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     }
 
     String savepointTime = savePointTimeline.lastInstant().get().requestedTime();
-    LOG.info("Deleting latest savepoint time " + savepointTime);
+    LOG.info("Deleting latest savepoint time {}", savepointTime);
     deleteSavepoint(savepointTime);
   }
 
@@ -725,7 +723,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     }
 
     String savepointTime = savePointTimeline.lastInstant().get().requestedTime();
-    LOG.info("Restoring to latest savepoint time " + savepointTime);
+    LOG.info("Restoring to latest savepoint time {}", savepointTime);
     restoreToSavepoint(savepointTime);
   }
 
@@ -752,8 +750,8 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
         boolean deleteMDT = false;
         if (oldestMdtCompaction.isPresent()) {
           if (LESSER_THAN_OR_EQUALS.test(savepointTime, oldestMdtCompaction.get().requestedTime())) {
-            LOG.warn(String.format("Deleting MDT during restore to %s as the savepoint is older than oldest compaction %s on MDT",
-                savepointTime, oldestMdtCompaction.get().requestedTime()));
+            LOG.warn("Deleting MDT during restore to {} as the savepoint is older than oldest compaction {} on MDT",
+                savepointTime, oldestMdtCompaction.get().requestedTime());
             deleteMDT = true;
           }
         }
@@ -763,8 +761,8 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
         if (!deleteMDT) {
           HoodieInstant syncedInstant = mdtMetaClient.createNewInstant(HoodieInstant.State.COMPLETED, HoodieTimeline.DELTA_COMMIT_ACTION, savepointTime);
           if (mdtMetaClient.getCommitsTimeline().isBeforeTimelineStarts(syncedInstant.requestedTime())) {
-            LOG.warn(String.format("Deleting MDT during restore to %s as the savepoint is older than the MDT timeline %s",
-                savepointTime, mdtMetaClient.getCommitsTimeline().firstInstant().get().requestedTime()));
+            LOG.warn("Deleting MDT during restore to {} as the savepoint is older than the MDT timeline {}",
+                savepointTime, mdtMetaClient.getCommitsTimeline().firstInstant().get().requestedTime());
             deleteMDT = true;
           }
         }
@@ -809,7 +807,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
    * @param savepointToRestoreTimestamp savepoint instant time to which restoration is requested
    */
   public HoodieRestoreMetadata restoreToInstant(final String savepointToRestoreTimestamp, boolean initialMetadataTableIfNecessary) throws HoodieRestoreException {
-    LOG.info("Begin restore to instant " + savepointToRestoreTimestamp);
+    LOG.info("Begin restore to instant {}", savepointToRestoreTimestamp);
     Timer.Context timerContext = metrics.getRollbackCtx();
     try {
       HoodieTable<T, I, K, O> table = initTable(WriteOperationType.UNKNOWN, Option.empty(), initialMetadataTableIfNecessary);
@@ -1376,7 +1374,6 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     // mismatch of table versions.
     CommonClientUtils.validateTableVersion(tableConfig, writeConfig);
 
-    Properties properties = writeConfig.getProps();
     // Once meta fields are disabled, it cant be re-enabled for a given table.
     if (!tableConfig.populateMetaFields() && writeConfig.populateMetaFields()) {
       throw new HoodieException(HoodieTableConfig.POPULATE_META_FIELDS.key() + " already disabled for the table. Can't be re-enabled back");
@@ -1385,7 +1382,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     // Meta fields can be disabled only when either {@code SimpleKeyGenerator}, {@code ComplexKeyGenerator},
     // {@code NonpartitionedKeyGenerator} is used
     if (!tableConfig.populateMetaFields()) {
-      String keyGenClass = KeyGeneratorType.getKeyGeneratorClassName(new HoodieConfig(properties));
+      String keyGenClass = KeyGeneratorType.getKeyGeneratorClassName(writeConfig);
       if (StringUtils.isNullOrEmpty(keyGenClass)) {
         keyGenClass = "org.apache.hudi.keygen.SimpleKeyGenerator";
       }
@@ -1400,7 +1397,7 @@ public abstract class BaseHoodieWriteClient<T, I, K, O> extends BaseHoodieClient
     if (tableConfig.getTableType() == HoodieTableType.COPY_ON_WRITE) {
       HoodieIndex.IndexType indexType = writeConfig.getIndexType();
       if (indexType != null && indexType.equals(HoodieIndex.IndexType.BUCKET)) {
-        String bucketEngine = properties.getProperty("hoodie.index.bucket.engine");
+        String bucketEngine = writeConfig.getString("hoodie.index.bucket.engine");
         if (bucketEngine != null && bucketEngine.equals("CONSISTENT_HASHING")) {
           throw new HoodieException("Consistent hashing bucket index does not work with COW table. Use simple bucket index or an MOR table.");
         }

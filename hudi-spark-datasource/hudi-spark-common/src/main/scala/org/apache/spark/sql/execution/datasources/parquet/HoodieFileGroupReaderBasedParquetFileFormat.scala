@@ -26,6 +26,7 @@ import org.apache.hudi.common.config.{HoodieMemoryConfig, TypedProperties}
 import org.apache.hudi.common.fs.FSUtils
 import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient}
 import org.apache.hudi.common.table.read.HoodieFileGroupReader
+import org.apache.hudi.data.CloseableIteratorListener
 import org.apache.hudi.internal.schema.InternalSchema
 import org.apache.hudi.io.IOUtils
 import org.apache.hudi.storage.StorageConfiguration
@@ -163,21 +164,26 @@ class HoodieFileGroupReaderBasedParquetFileFormat(tablePath: String,
 
     (file: PartitionedFile) => {
       val storageConf = new HadoopStorageConfiguration(broadcastedStorageConf.value.value)
-      file.partitionValues match {
+      val iter = file.partitionValues match {
         // Snapshot or incremental queries.
         case fileSliceMapping: HoodiePartitionFileSliceMapping =>
-          val filegroupName = FSUtils.getFileIdFromFilePath(sparkAdapter
+          val fileGroupName = FSUtils.getFileIdFromFilePath(sparkAdapter
             .getSparkPartitionedFileUtils.getPathFromPartitionedFile(file))
-          fileSliceMapping.getSlice(filegroupName) match {
+          fileSliceMapping.getSlice(fileGroupName) match {
             case Some(fileSlice) if !isCount && (requiredSchema.nonEmpty || fileSlice.getLogFiles.findAny().isPresent) =>
-              val readerContext = new SparkFileFormatInternalRowReaderContext(parquetFileReader.value, filters, requiredFilters)
               val metaClient: HoodieTableMetaClient = HoodieTableMetaClient
                 .builder().setConf(storageConf).setBasePath(tablePath).build
+              val readerContext = new SparkFileFormatInternalRowReaderContext(parquetFileReader.value, filters, requiredFilters, storageConf, metaClient.getTableConfig)
               val props = metaClient.getTableConfig.getProps
               options.foreach(kv => props.setProperty(kv._1, kv._2))
               props.put(HoodieMemoryConfig.MAX_MEMORY_FOR_MERGE.key(), String.valueOf(maxMemoryPerCompaction))
+              val baseFileLength = if (fileSlice.getBaseFile.isPresent) {
+                fileSlice.getBaseFile.get.getFileSize
+              } else {
+                0
+              }
               val reader = new HoodieFileGroupReader[InternalRow](readerContext, new HoodieHadoopStorage(metaClient.getBasePath, storageConf), tablePath, queryTimestamp,
-                fileSlice, dataAvroSchema, requestedAvroSchema, internalSchemaOpt, metaClient, props, file.start, file.length, shouldUseRecordPosition, false)
+                fileSlice, dataAvroSchema, requestedAvroSchema, internalSchemaOpt, metaClient, props, file.start, baseFileLength, shouldUseRecordPosition, false)
               reader.initRecordIterators()
               // Append partition values to rows and project to output schema
               appendPartitionAndProject(
@@ -200,6 +206,7 @@ class HoodieFileGroupReaderBasedParquetFileFormat(tablePath: String,
           readBaseFile(file, parquetFileReader.value, requestedSchema, remainingPartitionSchema, fixedPartitionIndexes,
             requiredSchema, partitionSchema, outputSchema, filters, storageConf)
       }
+      CloseableIteratorListener.addListener(iter)
     }
   }
 
@@ -265,6 +272,7 @@ class HoodieFileGroupReaderBasedParquetFileFormat(tablePath: String,
 
   private def makeCloseableFileGroupMappingRecordIterator(closeableFileGroupRecordIterator: HoodieFileGroupReader.HoodieFileGroupReaderIterator[InternalRow],
                                                           mappingFunction: Function[InternalRow, InternalRow]): Iterator[InternalRow] = {
+    CloseableIteratorListener.addListener(closeableFileGroupRecordIterator)
     new Iterator[InternalRow] with Closeable {
       override def hasNext: Boolean = closeableFileGroupRecordIterator.hasNext
 

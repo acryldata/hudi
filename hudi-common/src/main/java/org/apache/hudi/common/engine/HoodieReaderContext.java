@@ -22,11 +22,15 @@ package org.apache.hudi.common.engine;
 import org.apache.hudi.common.config.RecordMergeMode;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.HoodieRecordMerger;
+import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.read.FileGroupReaderSchemaHandler;
+import org.apache.hudi.common.table.read.BufferedRecord;
 import org.apache.hudi.common.util.LocalAvroSchemaCache;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.ClosableIterator;
+import org.apache.hudi.keygen.KeyGenerator;
 import org.apache.hudi.storage.HoodieStorage;
+import org.apache.hudi.storage.StorageConfiguration;
 import org.apache.hudi.storage.StoragePath;
 import org.apache.hudi.storage.StoragePathInfo;
 
@@ -36,11 +40,10 @@ import org.apache.avro.generic.IndexedRecord;
 
 import javax.annotation.Nullable;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.function.BiFunction;
 import java.util.function.UnaryOperator;
 
 import static org.apache.hudi.common.model.HoodieRecord.DEFAULT_ORDERING_VALUE;
@@ -57,8 +60,9 @@ import static org.apache.hudi.common.model.HoodieRecord.RECORD_KEY_METADATA_FIEL
  * @param <T> The type of engine-specific record representation, e.g.,{@code InternalRow} in Spark
  *            and {@code RowData} in Flink.
  */
-public abstract class HoodieReaderContext<T> implements Closeable {
-
+public abstract class HoodieReaderContext<T> {
+  private final StorageConfiguration<?> storageConfiguration;
+  private final BiFunction<T, Schema, String> recordKeyExtractor;
   private FileGroupReaderSchemaHandler<T> schemaHandler = null;
   private String tablePath = null;
   private String latestCommitTime = null;
@@ -70,6 +74,13 @@ public abstract class HoodieReaderContext<T> implements Closeable {
 
   // for encoding and decoding schemas to the spillable map
   private final LocalAvroSchemaCache localAvroSchemaCache = LocalAvroSchemaCache.getInstance();
+
+  protected HoodieReaderContext(StorageConfiguration<?> storageConfiguration,
+                                HoodieTableConfig tableConfig) {
+    this.storageConfiguration = storageConfiguration;
+    this.recordKeyExtractor = tableConfig.populateMetaFields() ? metadataKeyExtractor() : virtualKeyExtractor(tableConfig.getRecordKeyFields()
+        .orElseThrow(() -> new IllegalArgumentException("No record keys specified and meta fields are not populated")));
+  }
 
   // Getter and Setter for schemaHandler
   public FileGroupReaderSchemaHandler<T> getSchemaHandler() {
@@ -143,14 +154,9 @@ public abstract class HoodieReaderContext<T> implements Closeable {
     this.shouldMergeUseRecordPosition = shouldMergeUseRecordPosition;
   }
 
-  // These internal key names are only used in memory for record metadata and merging,
-  // and should not be persisted to storage.
-  public static final String INTERNAL_META_RECORD_KEY = "_0";
-  public static final String INTERNAL_META_PARTITION_PATH = "_1";
-  public static final String INTERNAL_META_ORDERING_FIELD = "_2";
-  public static final String INTERNAL_META_OPERATION = "_3";
-  public static final String INTERNAL_META_INSTANT_TIME = "_4";
-  public static final String INTERNAL_META_SCHEMA_ID = "_5";
+  public StorageConfiguration<?> getStorageConfiguration() {
+    return storageConfiguration;
+  }
 
   /**
    * Gets the record iterator based on the type of engine-specific record representation from the
@@ -210,7 +216,7 @@ public abstract class HoodieReaderContext<T> implements Closeable {
    *
    * @param record    The record in engine-specific type.
    * @param schema    The Avro schema of the record.
-   * @param fieldName The field name.
+   * @param fieldName The field name. A dot separated string if a nested field.
    * @return The field value.
    */
   public abstract Object getValue(T record, Schema schema, String fieldName);
@@ -236,46 +242,50 @@ public abstract class HoodieReaderContext<T> implements Closeable {
    * @return The record key in String.
    */
   public String getRecordKey(T record, Schema schema) {
-    Object val = getValue(record, schema, RECORD_KEY_METADATA_FIELD);
-    return val.toString();
+    return recordKeyExtractor.apply(record, schema);
+  }
+
+  private BiFunction<T, Schema, String> metadataKeyExtractor() {
+    return (record, schema) -> getValue(record, schema, RECORD_KEY_METADATA_FIELD).toString();
+  }
+
+  private BiFunction<T, Schema, String> virtualKeyExtractor(String[] recordKeyFields) {
+    return (record, schema) -> {
+      BiFunction<String, Integer, String> valueFunction = (recordKeyField, index) -> {
+        Object result = getValue(record, schema, recordKeyField);
+        return result != null ? result.toString() : null;
+      };
+      return KeyGenerator.constructRecordKey(recordKeyFields, valueFunction);
+    };
   }
 
   /**
    * Gets the ordering value in particular type.
    *
-   * @param recordOption An option of record.
-   * @param metadataMap  A map containing the record metadata.
-   * @param schema       The Avro schema of the record.
+   * @param record An option of record.
+   * @param schema The Avro schema of the record.
    * @param orderingFieldName name of the ordering field
    * @return The ordering value.
    */
-  public Comparable getOrderingValue(Option<T> recordOption,
-                                     Map<String, Object> metadataMap,
+  public Comparable getOrderingValue(T record,
                                      Schema schema,
                                      Option<String> orderingFieldName) {
-    if (metadataMap.containsKey(INTERNAL_META_ORDERING_FIELD)) {
-      return (Comparable) metadataMap.get(INTERNAL_META_ORDERING_FIELD);
-    }
-
-    if (!recordOption.isPresent() || orderingFieldName.isEmpty()) {
+    if (orderingFieldName.isEmpty()) {
       return DEFAULT_ORDERING_VALUE;
     }
 
-    Object value = getValue(recordOption.get(), schema, orderingFieldName.get());
+    Object value = getValue(record, schema, orderingFieldName.get());
     Comparable finalOrderingVal = value != null ? convertValueToEngineType((Comparable) value) : DEFAULT_ORDERING_VALUE;
-    metadataMap.put(INTERNAL_META_ORDERING_FIELD, finalOrderingVal);
     return finalOrderingVal;
   }
 
   /**
-   * Constructs a new {@link HoodieRecord} based on the record of engine-specific type and metadata for merging.
+   * Constructs a new {@link HoodieRecord} based on the given buffered record {@link BufferedRecord}.
    *
-   * @param recordOption An option of the record in engine-specific type if exists.
-   * @param metadataMap  The record metadata.
+   * @param bufferedRecord  The {@link BufferedRecord} object with engine-specific row
    * @return A new instance of {@link HoodieRecord}.
    */
-  public abstract HoodieRecord<T> constructHoodieRecord(Option<T> recordOption,
-                                                        Map<String, Object> metadataMap);
+  public abstract HoodieRecord<T> constructHoodieRecord(BufferedRecord<T> bufferedRecord);
 
   /**
    * Seals the engine-specific record to make sure the data referenced in memory do not change.
@@ -286,58 +296,24 @@ public abstract class HoodieReaderContext<T> implements Closeable {
   public abstract T seal(T record);
 
   /**
-   * Generates metadata map based on the information.
+   * Converts engine specific row into binary format.
    *
-   * @param recordKey     Record key in String.
-   * @param partitionPath Partition path in String.
-   * @param orderingVal   Ordering value in String.
-   * @return A mapping containing the metadata.
+   * @param avroSchema The avro schema of the row
+   * @param record     The engine row
+   *
+   * @return row in binary format
    */
-  public Map<String, Object> generateMetadataForRecord(
-      String recordKey, String partitionPath, Comparable orderingVal) {
-    Map<String, Object> meta = new HashMap<>();
-    meta.put(INTERNAL_META_RECORD_KEY, recordKey);
-    meta.put(INTERNAL_META_PARTITION_PATH, partitionPath);
-    meta.put(INTERNAL_META_ORDERING_FIELD, orderingVal);
-    return meta;
-  }
+  public abstract T toBinaryRow(Schema avroSchema, T record);
 
   /**
-   * Generates metadata of the record. Only fetches record key that is necessary for merging.
+   * Gets the schema encoded in the buffered record {@code BufferedRecord}.
    *
-   * @param record The record.
-   * @param schema The Avro schema of the record.
-   * @return A mapping containing the metadata.
-   */
-  public Map<String, Object> generateMetadataForRecord(T record, Schema schema) {
-    Map<String, Object> meta = new HashMap<>();
-    meta.put(INTERNAL_META_RECORD_KEY, getRecordKey(record, schema));
-    meta.put(INTERNAL_META_SCHEMA_ID, encodeAvroSchema(schema));
-    return meta;
-  }
-
-  /**
-   * Gets the schema encoded in the metadata map
+   * @param record {@link BufferedRecord} object with engine-specific type
    *
-   * @param infoMap The record metadata
-   * @return the avro schema if it is encoded in the metadata map, else null
+   * @return The avro schema if it is encoded in the metadata map, else null
    */
-  public Schema getSchemaFromMetadata(Map<String, Object> infoMap) {
-    return decodeAvroSchema(infoMap.get(INTERNAL_META_SCHEMA_ID));
-  }
-
-  /**
-   * Updates the schema and reset the ordering value in existing metadata mapping of a record.
-   *
-   * @param meta   Metadata in a mapping.
-   * @param schema New schema to set.
-   * @return The input metadata mapping.
-   */
-  public Map<String, Object> updateSchemaAndResetOrderingValInMetadata(Map<String, Object> meta,
-                                                                       Schema schema) {
-    meta.remove(INTERNAL_META_ORDERING_FIELD);
-    meta.put(INTERNAL_META_SCHEMA_ID, encodeAvroSchema(schema));
-    return meta;
+  public Schema getSchemaFromBufferRecord(BufferedRecord<T> record) {
+    return decodeAvroSchema(record.getSchemaId());
   }
 
   /**
@@ -409,7 +385,7 @@ public abstract class HoodieReaderContext<T> implements Closeable {
   /**
    * Encodes the given avro schema for efficient serialization.
    */
-  private Integer encodeAvroSchema(Schema schema) {
+  public Integer encodeAvroSchema(Schema schema) {
     return this.localAvroSchemaCache.cacheSchema(schema);
   }
 
@@ -419,12 +395,5 @@ public abstract class HoodieReaderContext<T> implements Closeable {
   @Nullable
   private Schema decodeAvroSchema(Object versionId) {
     return this.localAvroSchemaCache.getSchema((Integer) versionId).orElse(null);
-  }
-
-  @Override
-  public void close() {
-    if (this.localAvroSchemaCache != null) {
-      this.localAvroSchemaCache.close();
-    }
   }
 }

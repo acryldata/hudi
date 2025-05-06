@@ -427,8 +427,11 @@ case class ResolveImplementations(sparkSession: SparkSession) extends Rule[Logic
     AnalysisHelper.allowInvokingTransformsInAnalyzer {
       plan match {
         // Convert to MergeIntoHoodieTableCommand
-        case mit@MatchMergeIntoTable(target@ResolvesToHudiTable(_), _, _) if mit.resolved =>
-          MergeIntoHoodieTableCommand(ReplaceExpressions(mit).asInstanceOf[MergeIntoTable])
+        case mit@MatchMergeIntoTable(target@ResolvesToHudiTable(table), _, _) if mit.resolved =>
+          val catalogTable = HoodieCatalogTable(sparkSession, table)
+          val command = MergeIntoHoodieTableCommand(ReplaceExpressions(mit).asInstanceOf[MergeIntoTable], catalogTable, sparkSession, null)
+          val inputPlan = command.getProcessedInputPlan
+          command.copy(query = inputPlan)
 
         // Convert to UpdateHoodieTableCommand
         case ut@UpdateTable(plan@ResolvesToHudiTable(_), _, _) if ut.resolved =>
@@ -437,8 +440,10 @@ case class ResolveImplementations(sparkSession: SparkSession) extends Rule[Logic
 
 
         // Convert to DeleteHoodieTableCommand
-        case dft@DeleteFromTable(plan@ResolvesToHudiTable(_), _) if dft.resolved =>
-          DeleteHoodieTableCommand(dft)
+        case dft@DeleteFromTable(ResolvesToHudiTable(table), _) if dft.resolved =>
+          val catalogTable = new HoodieCatalogTable(sparkSession, table)
+          val (plan, config) = DeleteHoodieTableCommand.inputPlan(sparkSession, dft, catalogTable)
+          DeleteHoodieTableCommand(catalogTable, plan, config)
 
         // Convert to CompactionHoodieTableCommand
         case ct @ CompactionTable(plan @ ResolvesToHudiTable(table), operation, options) if ct.resolved =>

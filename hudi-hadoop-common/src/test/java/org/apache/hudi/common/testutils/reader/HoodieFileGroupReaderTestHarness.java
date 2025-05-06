@@ -42,8 +42,10 @@ import java.util.List;
 import java.util.Properties;
 
 import static org.apache.hudi.common.table.HoodieTableConfig.POPULATE_META_FIELDS;
+import static org.apache.hudi.common.table.HoodieTableConfig.RECORDKEY_FIELDS;
 import static org.apache.hudi.common.testutils.HoodieTestDataGenerator.AVRO_SCHEMA;
 import static org.apache.hudi.common.testutils.HoodieTestUtils.getDefaultStorageConf;
+import static org.apache.hudi.common.testutils.reader.HoodieFileSliceTestUtils.ROW_KEY;
 
 public class HoodieFileGroupReaderTestHarness extends HoodieCommonTestHarness {
   protected static final String PARTITION_PATH = "any-partition-path";
@@ -56,13 +58,13 @@ public class HoodieFileGroupReaderTestHarness extends HoodieCommonTestHarness {
   protected static List<DataGenerationPlan.OperationType> operationTypes;
   // Set the instantTime for each record set.
   protected static List<String> instantTimes;
-  protected static List<Boolean> shouldWritePositions;
+  protected List<Boolean> shouldWritePositions;
 
   // Environmental variables.
   protected static StorageConfiguration<?> storageConf;
   protected static HoodieTestTable testTable;
-  protected static HoodieReaderContext<IndexedRecord> readerContext;
   protected static TypedProperties properties;
+  protected HoodieReaderContext<IndexedRecord> readerContext;
 
   static {
     // Note: Make `timestamp` as ordering field.
@@ -70,8 +72,6 @@ public class HoodieFileGroupReaderTestHarness extends HoodieCommonTestHarness {
     properties.setProperty(
         "hoodie.datasource.write.precombine.field", "timestamp");
     storageConf = getDefaultStorageConf();
-    readerContext = new HoodieTestReaderContext(
-        Option.empty(), Option.empty());
   }
 
   @AfterAll
@@ -95,6 +95,7 @@ public class HoodieFileGroupReaderTestHarness extends HoodieCommonTestHarness {
   protected void initMetaClient() throws IOException {
     Properties metaProps = getMetaProps();
     metaProps.setProperty(POPULATE_META_FIELDS.key(), "false");
+    metaProps.setProperty(RECORDKEY_FIELDS.key(), ROW_KEY);
     if (basePath == null) {
       initPath();
     }

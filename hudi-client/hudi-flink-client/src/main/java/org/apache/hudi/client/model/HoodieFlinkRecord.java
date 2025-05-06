@@ -18,41 +18,56 @@
 
 package org.apache.hudi.client.model;
 
+import org.apache.hudi.avro.HoodieAvroUtils;
+import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.model.HoodieAvroIndexedRecord;
 import org.apache.hudi.common.model.HoodieKey;
 import org.apache.hudi.common.model.HoodieOperation;
 import org.apache.hudi.common.model.HoodieRecord;
 import org.apache.hudi.common.model.MetadataValues;
+import org.apache.hudi.common.util.ConfigUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.collection.Pair;
 import org.apache.hudi.keygen.BaseKeyGenerator;
+import org.apache.hudi.util.RowDataAvroQueryContexts;
+import org.apache.hudi.util.RowDataAvroQueryContexts.RowDataQueryContext;
 
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.IndexedRecord;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.utils.JoinedRowData;
 
-import java.io.IOException;
+import java.io.ByteArrayOutputStream;
 import java.util.Map;
 import java.util.Properties;
+
+import static org.apache.hudi.common.util.StringUtils.isNullOrEmpty;
 
 /**
  * Flink Engine-specific Implementations of `HoodieRecord`, which is expected to hold {@code RowData} as payload.
  */
 public class HoodieFlinkRecord extends HoodieRecord<RowData> {
-  private Comparable<?> orderingValue = 0;
 
   public HoodieFlinkRecord(RowData rowData) {
     super(null, rowData);
   }
 
+  public HoodieFlinkRecord(HoodieKey key, HoodieOperation op, RowData rowData) {
+    super(key, rowData, op, Option.empty());
+  }
+
   public HoodieFlinkRecord(HoodieKey key, HoodieOperation op, Comparable<?> orderingValue, RowData rowData) {
     super(key, rowData, op, Option.empty());
     this.orderingValue = orderingValue;
+  }
+
+  public HoodieFlinkRecord(HoodieKey key, RowData rowData) {
+    super(key, rowData);
   }
 
   @Override
@@ -71,8 +86,21 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
   }
 
   @Override
-  public Comparable<?> getOrderingValue(Schema recordSchema, Properties props) {
-    return this.orderingValue;
+  public HoodieOperation getOperation() {
+    if (this.operation == null) {
+      this.operation = HoodieOperation.fromValue(data.getRowKind().toByteValue());
+    }
+    return this.operation;
+  }
+
+  @Override
+  protected Comparable<?> doGetOrderingValue(Schema recordSchema, Properties props) {
+    String orderingField = ConfigUtils.getOrderingField(props);
+    if (isNullOrEmpty(orderingField)) {
+      return DEFAULT_ORDERING_VALUE;
+    } else {
+      return (Comparable<?>) getColumnValueAsJava(recordSchema, orderingField, props, false);
+    }
   }
 
   @Override
@@ -106,6 +134,18 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
   }
 
   @Override
+  public Object getColumnValueAsJava(Schema recordSchema, String column, Properties props) {
+    return getColumnValueAsJava(recordSchema, column, props, true);
+  }
+
+  private Object getColumnValueAsJava(Schema recordSchema, String column, Properties props, boolean allowsNull) {
+    boolean utcTimezone = Boolean.parseBoolean(props.getProperty(
+        HoodieStorageConfig.WRITE_UTC_TIMEZONE.key(), HoodieStorageConfig.WRITE_UTC_TIMEZONE.defaultValue().toString()));
+    RowDataQueryContext rowDataQueryContext = RowDataAvroQueryContexts.fromAvroSchema(recordSchema, utcTimezone);
+    return rowDataQueryContext.getFieldQueryContext(column).getValAsJava(data, allowsNull);
+  }
+
+  @Override
   public HoodieRecord joinWith(HoodieRecord other, Schema targetSchema) {
     throw new UnsupportedOperationException("Not supported for " + this.getClass().getSimpleName());
   }
@@ -124,12 +164,21 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
   }
 
   @Override
+  public HoodieRecord updateMetaField(Schema recordSchema, int ordinal, String value) {
+    String[] metaVals = new String[HoodieRecord.HOODIE_META_COLUMNS.size()];
+    metaVals[ordinal] = value;
+    boolean withOperation = recordSchema.getField(OPERATION_METADATA_FIELD) != null;
+    RowData rowData = new HoodieRowDataWithUpdatedMetaField(metaVals, ordinal, getData(), withOperation);
+    return new HoodieFlinkRecord(getKey(), getOperation(), orderingValue, rowData);
+  }
+
+  @Override
   public HoodieRecord rewriteRecordWithNewSchema(Schema recordSchema, Properties props, Schema newSchema, Map<String, String> renameCols) {
     throw new UnsupportedOperationException("Not supported for " + this.getClass().getSimpleName());
   }
 
   @Override
-  public boolean isDelete(Schema recordSchema, Properties props) throws IOException {
+  public boolean isDelete(Schema recordSchema, Properties props) {
     if (data == null) {
       return true;
     }
@@ -144,7 +193,7 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
   }
 
   @Override
-  public boolean shouldIgnore(Schema recordSchema, Properties props) throws IOException {
+  public boolean shouldIgnore(Schema recordSchema, Properties props) {
     return false;
   }
 
@@ -160,7 +209,7 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
 
   @Override
   public HoodieRecord wrapIntoHoodieRecordPayloadWithParams(Schema recordSchema, Properties props, Option<Pair<String, String>> simpleKeyGenFieldsOpt, Boolean withOperation,
-                                                            Option<String> partitionNameOp, Boolean populateMetaFieldsOp, Option<Schema> schemaWithoutMetaFields) throws IOException {
+                                                            Option<String> partitionNameOp, Boolean populateMetaFieldsOp, Option<Schema> schemaWithoutMetaFields) {
     throw new UnsupportedOperationException("Not supported for " + this.getClass().getSimpleName());
   }
 
@@ -170,12 +219,25 @@ public class HoodieFlinkRecord extends HoodieRecord<RowData> {
   }
 
   @Override
-  public HoodieRecord truncateRecordKey(Schema recordSchema, Properties props, String keyFieldName) throws IOException {
+  public HoodieRecord truncateRecordKey(Schema recordSchema, Properties props, String keyFieldName) {
     throw new UnsupportedOperationException("Not supported for " + this.getClass().getSimpleName());
   }
 
   @Override
-  public Option<HoodieAvroIndexedRecord> toIndexedRecord(Schema recordSchema, Properties props) throws IOException {
-    throw new UnsupportedOperationException("Not supported for " + this.getClass().getSimpleName());
+  public Option<HoodieAvroIndexedRecord> toIndexedRecord(Schema recordSchema, Properties props) {
+    boolean utcTimezone = Boolean.parseBoolean(props.getProperty(
+        HoodieStorageConfig.WRITE_UTC_TIMEZONE.key(), HoodieStorageConfig.WRITE_UTC_TIMEZONE.defaultValue().toString()));
+    RowDataQueryContext rowDataQueryContext = RowDataAvroQueryContexts.fromAvroSchema(recordSchema, utcTimezone);
+    IndexedRecord indexedRecord = (IndexedRecord) rowDataQueryContext.getRowDataToAvroConverter().convert(recordSchema, getData());
+    return Option.of(new HoodieAvroIndexedRecord(getKey(), indexedRecord, getOperation(), getMetadata()));
+  }
+
+  @Override
+  public ByteArrayOutputStream getAvroBytes(Schema recordSchema, Properties props) {
+    boolean utcTimezone = Boolean.parseBoolean(props.getProperty(
+        HoodieStorageConfig.WRITE_UTC_TIMEZONE.key(), HoodieStorageConfig.WRITE_UTC_TIMEZONE.defaultValue().toString()));
+    RowDataQueryContext rowDataQueryContext = RowDataAvroQueryContexts.fromAvroSchema(recordSchema, utcTimezone);
+    IndexedRecord indexedRecord = (IndexedRecord) rowDataQueryContext.getRowDataToAvroConverter().convert(recordSchema, getData());
+    return HoodieAvroUtils.avroToBytesStream(indexedRecord);
   }
 }

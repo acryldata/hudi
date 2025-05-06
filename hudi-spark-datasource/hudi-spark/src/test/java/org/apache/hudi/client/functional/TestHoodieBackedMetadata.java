@@ -31,12 +31,14 @@ import org.apache.hudi.common.config.HoodieMetadataConfig;
 import org.apache.hudi.common.config.HoodieStorageConfig;
 import org.apache.hudi.common.config.LockConfiguration;
 import org.apache.hudi.common.config.RecordMergeMode;
+import org.apache.hudi.common.config.TypedProperties;
 import org.apache.hudi.common.fs.ConsistencyGuardConfig;
 import org.apache.hudi.common.fs.FSUtils;
 import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieAvroRecord;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.model.HoodieCleaningPolicy;
+import org.apache.hudi.common.model.HoodieColumnRangeMetadata;
 import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieFailedWritesCleaningPolicy;
 import org.apache.hudi.common.model.HoodieFileFormat;
@@ -92,6 +94,7 @@ import org.apache.hudi.exception.HoodieException;
 import org.apache.hudi.exception.HoodieMetadataException;
 import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.io.storage.HoodieAvroHFileReaderImplBase;
+import org.apache.hudi.io.storage.HoodieIOFactory;
 import org.apache.hudi.metadata.FileSystemBackedTableMetadata;
 import org.apache.hudi.metadata.HoodieBackedTableMetadata;
 import org.apache.hudi.metadata.HoodieBackedTableMetadataWriter;
@@ -121,6 +124,7 @@ import org.apache.avro.generic.IndexedRecord;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -152,11 +156,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
+import static org.apache.hudi.avro.HoodieAvroUtils.unwrapAvroValueWrapper;
 import static org.apache.hudi.common.config.LockConfiguration.FILESYSTEM_LOCK_PATH_PROP_KEY;
 import static org.apache.hudi.common.model.HoodieTableType.COPY_ON_WRITE;
 import static org.apache.hudi.common.model.HoodieTableType.MERGE_ON_READ;
@@ -1169,7 +1175,7 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
 
     HoodieTableMetadata metadataReader = HoodieTableMetadata.create(
         context, storage, writeConfig.getMetadataConfig(), writeConfig.getBasePath());
-    Map<String, List<HoodieRecordGlobalLocation>> result = metadataReader
+    Map<String, HoodieRecordGlobalLocation> result = metadataReader
         .readRecordIndex(records1.stream().map(HoodieRecord::getRecordKey).collect(Collectors.toList()));
     assertEquals(0, result.size(), "RI should not return entries that are rolled back.");
     result = metadataReader
@@ -2007,7 +2013,6 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
       // 1 partition and 2 commits. total entries should be 2.
       assertEquals(result.size(), 2);
       result.forEach(entry -> {
-        // LOG.warn("Prefix search entries for record key col and first partition : " + entry.getRecordKey().toString() + " :: " + entry.getData().getColumnStatMetadata().get().toString());
         HoodieMetadataColumnStats metadataColumnStats = entry.getData().getColumnStatMetadata().get();
         // for commit time column, min max should be the same since we disable small files, every commit will create a new file
         assertEquals(metadataColumnStats.getMinValue(), metadataColumnStats.getMaxValue());
@@ -3141,6 +3146,71 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
     }
   }
 
+  @Test
+  public void testColStatsMultipleColumns() throws Exception {
+    initPath();
+    Properties properties = new TypedProperties();
+    properties.put(HoodieTableConfig.PARTITION_FIELDS.key(), "partition_path");
+    HoodieWriteConfig writeConfig = getWriteConfigBuilder(true, true, false)
+        .withMetadataConfig(HoodieMetadataConfig.newBuilder().enable(true)
+            .withMetadataIndexColumnStats(true)
+            .withColumnStatsIndexForColumns("begin_lat,end_lat,distance_in_meters,weight")
+            .withProperties(properties)
+            .build()).build();
+    init(HoodieTableType.COPY_ON_WRITE, writeConfig);
+    initMetaClient(writeConfig.getProps());
+    HoodieSparkEngineContext engineContext = new HoodieSparkEngineContext(jsc);
+
+    HoodieTestDataGenerator partitionedGenerator = new HoodieTestDataGenerator();
+    try (SparkRDDWriteClient client = new SparkRDDWriteClient(engineContext, writeConfig)) {
+      // Write 1 (Bulk insert)
+      String newCommitTime = "0000001";
+      List<HoodieRecord> records = partitionedGenerator.generateInserts(newCommitTime, 10);
+      client.startCommitWithTime(newCommitTime);
+      client.bulkInsert(jsc.parallelize(records, 1), newCommitTime).collect();
+
+      HoodieTableMetadata tableMetadata = metadata(client, metaClient.getStorage());
+      List<String> metadataPartitions = tableMetadata.getAllPartitionPaths();
+      List<Pair<String, String>> partitionNameFileNameList = new ArrayList<>();
+      for (String metadataPartition : metadataPartitions) {
+        partitionNameFileNameList.addAll(
+            tableMetadata.getAllFilesInPartitions(singletonList(String.format("%s/%s",basePath, metadataPartition))).entrySet().stream()
+            .flatMap(entry -> entry.getValue().stream().map(storagePathInfo -> Pair.of(metadataPartition, storagePathInfo.getPath().getName())))
+            .collect(Collectors.toList())
+        );
+      }
+      List<String> columns = Arrays.asList("begin_lat", "end_lat", "distance_in_meters", "weight", "seconds_since_epoch", "nation");
+      Map<Pair<String, String>, List<HoodieMetadataColumnStats>> colStatsFromMetadata = tableMetadata.getColumnStats(partitionNameFileNameList, columns);
+      assertEquals(partitionNameFileNameList.size(), colStatsFromMetadata.size());
+      // Assert stats from parquet footer same as metadata.
+      colStatsFromMetadata.forEach(((partitionAndFileName, stats) -> {
+        StoragePath fullFilePath = new StoragePath(basePath, String.format("%s/%s", partitionAndFileName.getLeft(), partitionAndFileName.getRight()));
+        Map<String, HoodieColumnRangeMetadata<Comparable>> parquetStatsMap =
+            HoodieIOFactory.getIOFactory(metaClient.getStorage())
+                .getFileFormatUtils(HoodieFileFormat.PARQUET)
+                .readColumnStatsFromMetadata(metaClient.getStorage(), fullFilePath, columns)
+                .stream()
+                .collect(Collectors.toMap(HoodieColumnRangeMetadata::getColumnName, Function.identity()));
+        Map<String, HoodieMetadataColumnStats> columnStatsMap = stats.stream().collect(Collectors.toMap(HoodieMetadataColumnStats::getColumnName, Function.identity()));
+        List<String> columnsWithoutStats = Arrays.asList("seconds_since_epoch", "nation");
+        Assertions.assertEquals(parquetStatsMap.size() - columnsWithoutStats.size(), columnStatsMap.size());
+        for (String column : columns) {
+          if (columnsWithoutStats.contains(column)) {
+            // Assert columnsWithoutStats are not present in MDT result.
+            Assertions.assertFalse(columnStatsMap.containsKey(column));
+            continue;
+          }
+          // Assert getColumnStats returns same data.
+          Assertions.assertEquals(columnStatsMap.get(column), tableMetadata.getColumnStats(Collections.singletonList(partitionAndFileName), column).get(partitionAndFileName));
+          Assertions.assertEquals(parquetStatsMap.get(column).getNullCount(), columnStatsMap.get(column).getNullCount());
+          Assertions.assertEquals(parquetStatsMap.get(column).getValueCount(),columnStatsMap.get(column).getValueCount());
+          Assertions.assertEquals(parquetStatsMap.get(column).getMaxValue(), unwrapAvroValueWrapper(columnStatsMap.get(column).getMaxValue()));
+          Assertions.assertEquals(parquetStatsMap.get(column).getMinValue(), unwrapAvroValueWrapper(columnStatsMap.get(column).getMinValue()));
+        }
+      }));
+    }
+  }
+
   /**
    * Test various metrics published by metadata table.
    */
@@ -3512,9 +3582,9 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
       // RI should have created mappings for all the records inserted above
       HoodieTableMetadata metadataReader = HoodieTableMetadata.create(
           context, storage, writeConfig.getMetadataConfig(), writeConfig.getBasePath());
-      Map<String, List<HoodieRecordGlobalLocation>> result = metadataReader
+      Map<String, HoodieRecordGlobalLocation> result = metadataReader
           .readRecordIndex(allRecords.stream().map(HoodieRecord::getRecordKey).collect(Collectors.toList()));
-      assertEquals(allRecords.size(), (int) result.values().stream().flatMap(List::stream).count(), "RI should have mapping for all the records in firstCommit");
+      assertEquals(allRecords.size(), result.size(), "RI should have mapping for all the records in firstCommit");
 
       // Delete some records from each commit. This should also remove the RI mapping.
       recordsToDelete = firstBatchOfrecords.subList(0, 3);
@@ -3546,7 +3616,7 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
 
       // RI should not return mappings for deleted records
       metadataReader = HoodieTableMetadata.create(context, storage, writeConfig.getMetadataConfig(), writeConfig.getBasePath());
-      Map<String, List<HoodieRecordGlobalLocation>> result = metadataReader.readRecordIndex(allRecords.stream().map(HoodieRecord::getRecordKey).collect(Collectors.toList()));
+      Map<String, HoodieRecordGlobalLocation> result = metadataReader.readRecordIndex(allRecords.stream().map(HoodieRecord::getRecordKey).collect(Collectors.toList()));
       assertEquals(allRecords.size() - keysToDelete.size(), result.size(), "RI should not have mapping for deleted records");
       result.keySet().forEach(mappingKey -> assertFalse(keysToDelete.contains(mappingKey), "RI should not have mapping for deleted records"));
 
@@ -3557,9 +3627,9 @@ public class TestHoodieBackedMetadata extends TestHoodieMetadataBase {
       // New mappings should have been created for re-inserted records and should map to the new commit time
       metadataReader = HoodieTableMetadata.create(context, storage, writeConfig.getMetadataConfig(), writeConfig.getBasePath());
       result = metadataReader.readRecordIndex(allRecords.stream().map(HoodieRecord::getRecordKey).collect(Collectors.toList()));
-      assertEquals(allRecords.size(), (int) result.values().stream().flatMap(List::stream).count(), "RI should have mappings for re-inserted records");
+      assertEquals(allRecords.size(), result.size(), "RI should have mappings for re-inserted records");
       for (String reInsertedKey : keysToDelete) {
-        assertTrue(result.get(reInsertedKey).stream().anyMatch(location -> location.getInstantTime().equals(reinsertTime)), "RI mapping for re-inserted keys should have new commit time");
+        assertEquals(reinsertTime, result.get(reInsertedKey).getInstantTime(), "RI mapping for re-inserted keys should have new commit time");
       }
     }
   }
